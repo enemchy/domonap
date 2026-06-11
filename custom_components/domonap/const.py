@@ -19,6 +19,7 @@ PARAM_INSTANCE_ID = "instance_id"
 PARAM_WEBRTC_PROXY_SECRET = "webrtc_proxy_secret"
 EVENT_INCOMING_CALL = "domonap_incoming_call"
 WEBRTC_PROXY = "webrtc_proxy"
+MEDIA_PROXY = "media_proxy"
 
 PLATFORMS: list[Platform] = [Platform.BUTTON, Platform.CAMERA, Platform.BINARY_SENSOR, Platform.SENSOR, Platform.IMAGE]
 

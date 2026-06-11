@@ -6,7 +6,6 @@ from typing import Optional, Callable
 from homeassistant.components.image import ImageEntity
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, API, EVENT_INCOMING_CALL
@@ -110,7 +109,9 @@ class IntercomCallImageEntity(ImageEntity):
         if event.data.get("DoorId") != self._door_id:
             return
 
-        photo_url: Optional[str] = event.data.get("PhotoUrl")
+        photo_url: Optional[str] = event.data.get("OriginalPhotoUrl") or event.data.get(
+            "PhotoUrl"
+        )
         if not photo_url:
             return
 
@@ -127,12 +128,9 @@ class IntercomCallImageEntity(ImageEntity):
         self.async_write_ha_state()
 
     async def _http_get_bytes(self, url: str) -> Optional[bytes]:
-        session = async_get_clientsession(self.hass)
-        try:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    return await resp.read()
-                _LOGGER.debug("GET %s returned HTTP %s", url, resp.status)
-        except Exception:
-            _LOGGER.exception("Failed to GET %s", url)
+        response = await self._api.fetch_external_bytes(url)
+        if response.get("ok"):
+            return response["body"]
+
+        _LOGGER.debug("GET %s failed: %s", url, response.get("error"))
         return None

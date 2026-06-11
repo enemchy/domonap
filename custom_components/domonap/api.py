@@ -332,19 +332,60 @@ class IntercomAPI:
         _LOGGER.debug("answer_call_notify(%s) -> %s", call_id, res)
         return {"ok": True, "body": res}
 
-    async def fetch_external_bytes(self, url: str) -> Dict[str, Any]:
+    async def fetch_external_bytes(
+        self,
+        url: str,
+        *,
+        authorized: bool = True,
+        headers: Optional[Dict[str, str]] = None,
+        retry_on_401: bool = True,
+    ) -> Dict[str, Any]:
+        if authorized:
+            auth_error = await self._ensure_external_auth()
+            if auth_error:
+                return auth_error
+
         session = await self._ensure_external_session()
-        try:
-            async with session.get(url) as resp:
-                body = await resp.read()
-                if 200 <= resp.status < 300:
-                    return {"ok": True, "status": resp.status, "body": body}
+
+        def _request():
+            request_headers = dict(headers or {})
+            if authorized:
+                request_headers = self._authorized_external_headers(request_headers)
+            return session.get(url, headers=request_headers)
+
+        async def _handle_response(resp: aiohttp.ClientResponse) -> Dict[str, Any]:
+            body = await resp.read()
+            if 200 <= resp.status < 300:
                 return {
-                    "ok": False,
-                    "error": f"HTTP {resp.status}",
+                    "ok": True,
                     "status": resp.status,
-                    "body": body[:2000].decode("utf-8", "replace"),
+                    "body": body,
+                    "content_type": resp.headers.get("Content-Type"),
                 }
+            return {
+                "ok": False,
+                "error": f"HTTP {resp.status}",
+                "status": resp.status,
+                "body": body[:2000].decode("utf-8", "replace"),
+            }
+
+        try:
+            async with _request() as resp:
+                if (
+                    resp.status == 401
+                    and authorized
+                    and retry_on_401
+                    and self.refresh_token
+                ):
+                    _LOGGER.warning(
+                        "401 Unauthorized, refreshing token and retrying external GET %s",
+                        url,
+                    )
+                    await self.update_token()
+                    async with _request() as retry_resp:
+                        return await _handle_response(retry_resp)
+
+                return await _handle_response(resp)
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
             _LOGGER.error("External GET failed: %s -> %s", url, err)
             return {"ok": False, "error": str(err), "body": ""}

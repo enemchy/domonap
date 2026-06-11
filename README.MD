@@ -55,7 +55,9 @@ time_fired: "2025-06-18T15:10:58.919425+00:00"
 ```
 * `DoorId` - идентификатор двери
 * `Address` - адрес вызывающего устройства 
-* `PhotoUrl` - URL фотографии звонящего
+* `PhotoUrl` / `photoUrl` - URL фотографии звонящего через локальный proxy Home Assistant с авторизацией в Domonap
+* `OriginalPhotoUrl` - оригинальный URL Domonap для диагностики
+* `VideoPreview` - URL превью через локальный proxy Home Assistant с авторизацией в Domonap
 
 2. При входящем сообщении```domonap_receive_message``` следующего содержания:
 ```yaml

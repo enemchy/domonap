@@ -19,9 +19,17 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class IntercomNotifyConsumer:
-    def __init__(self, hass: HomeAssistant, api: IntercomAPI) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        api: IntercomAPI,
+        media_proxy=None,
+        media_proxy_secret: Optional[str] = None,
+    ) -> None:
         self._hass = hass
         self._api = api
+        self._media_proxy = media_proxy
+        self._media_proxy_secret = media_proxy_secret
         self._callbacks: set[Callable[[], Union[None, Any]]] = set()
         self._notify_id_token: Optional[str] = None
         self._connected: bool = False
@@ -135,7 +143,7 @@ class IntercomNotifyConsumer:
             if isinstance(push_data, dict):
                 evt = push_data.get("EventMessage")
                 if evt == "DomofonCalling":
-                    push_data["PhotoUrl"] = PHOTO_URL + str(push_data.get("CallId", ""))
+                    self._prepare_incoming_call_event(push_data)
                     self._hass.bus.fire(EVENT_INCOMING_CALL, push_data)
                     _LOGGER.debug("Incoming call: %s", push_data)
                 else:
@@ -166,6 +174,34 @@ class IntercomNotifyConsumer:
             _LOGGER.debug(f"Read confirm messages in channel {data.get('arguments')[0]}")
         else:
             _LOGGER.debug(f"Unknown target type {data.get('target')} message:\n{data}")
+
+    def _prepare_incoming_call_event(self, push_data: dict) -> None:
+        call_id = str(push_data.get("CallId", ""))
+        photo_url = push_data.get("PhotoUrl") or push_data.get("photoUrl")
+        if not photo_url and call_id:
+            photo_url = PHOTO_URL + call_id
+
+        proxied_photo_url = self._proxied_media_url(photo_url)
+        if photo_url:
+            push_data.setdefault("OriginalPhotoUrl", photo_url)
+            push_data["PhotoUrl"] = proxied_photo_url or photo_url
+            push_data["photoUrl"] = proxied_photo_url or photo_url
+
+        video_preview = push_data.get("VideoPreview") or push_data.get("videoPreview")
+        proxied_video_preview = self._proxied_media_url(video_preview)
+        if video_preview:
+            push_data.setdefault("OriginalVideoPreview", video_preview)
+            push_data["VideoPreview"] = proxied_video_preview or video_preview
+            push_data["videoPreview"] = proxied_video_preview or video_preview
+
+    def _proxied_media_url(self, url: Optional[str]) -> Optional[str]:
+        if not url or not self._media_proxy or not self._media_proxy_secret:
+            return None
+        try:
+            return self._media_proxy.register_url(self._media_proxy_secret, self._api, url)
+        except Exception:
+            _LOGGER.debug("Failed to register Domonap media proxy URL", exc_info=True)
+            return None
 
     async def _publish_updates(self) -> None:
         for cb in list(self._callbacks):

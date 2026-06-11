@@ -17,6 +17,7 @@ from .const import (
     PARAM_INSTANCE_ID,
     PARAM_REFRESH_TOKEN,
     PARAM_REFRESH_EXPIRATION,
+    MEDIA_PROXY,
     PARAM_WEBRTC_PROXY_SECRET,
     PLATFORMS,
     UPDATE_INTERVAL,
@@ -34,6 +35,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
     # Register global actions (services).
     from .actions import async_setup_actions
+    from .media_proxy import DomonapMediaProxy, DomonapMediaProxyView
     from .webrtc_proxy import DomonapWebRTCProxy, DomonapWebRTCProxySessionView, DomonapWebRTCProxyView
 
     await async_setup_actions(hass)
@@ -41,6 +43,9 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     hass.data[DOMAIN][WEBRTC_PROXY] = proxy
     hass.http.register_view(DomonapWebRTCProxyView(proxy))
     hass.http.register_view(DomonapWebRTCProxySessionView(proxy))
+    media_proxy = DomonapMediaProxy(hass)
+    hass.data[DOMAIN][MEDIA_PROXY] = media_proxy
+    hass.http.register_view(DomonapMediaProxyView(media_proxy))
     return True
 
 
@@ -87,7 +92,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     api.token_update_callback = update_entry
 
-    consumer = IntercomNotifyConsumer(hass, api)
+    consumer = IntercomNotifyConsumer(
+        hass,
+        api,
+        hass.data[DOMAIN].get(MEDIA_PROXY),
+        new_data.get(PARAM_WEBRTC_PROXY_SECRET),
+    )
     hass.data[DOMAIN][entry.entry_id][API] = api
     hass.data[DOMAIN][entry.entry_id]["notify_consumer"] = consumer
 
