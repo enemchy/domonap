@@ -2,9 +2,9 @@ import logging
 import aiohttp
 import asyncio
 from datetime import datetime, timezone
-from secrets import token_urlsafe
+from secrets import token_bytes
 from typing import Any, Callable, Dict, Optional, Union
-from uuid import uuid4
+from uuid import UUID
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -13,14 +13,45 @@ DEFAULT_DEVICE_PLATFORM = "Android"
 DEFAULT_DOM_APP = "mobile"
 DEFAULT_JSON_CONTENT_TYPE = "application/json; charset=UTF-8"
 DEFAULT_USER_AGENT = "okhttp/5.3.2"
+_ANDROID_GUID_RETRY_LIMIT = 8
+_GENERATED_ANDROID_GUIDS: set[str] = set()
 
 
 def _with_app_header_suffix(value: str) -> str:
     return value if value.endswith(";") else f"{value};"
 
 
+def _generate_android_guid() -> str:
+    random_bytes = bytearray(token_bytes(16))
+    # Match Java/Android UUID.randomUUID(): RFC 4122 variant, version 4.
+    random_bytes[6] = (random_bytes[6] & 0x0F) | 0x40
+    random_bytes[8] = (random_bytes[8] & 0x3F) | 0x80
+    return str(UUID(bytes=bytes(random_bytes)))
+
+
+def _generate_unique_android_guid() -> str:
+    for _ in range(_ANDROID_GUID_RETRY_LIMIT):
+        guid = _generate_android_guid()
+        if guid not in _GENERATED_ANDROID_GUIDS:
+            _GENERATED_ANDROID_GUIDS.add(guid)
+            return guid
+    guid = _generate_android_guid()
+    _GENERATED_ANDROID_GUIDS.add(guid)
+    return guid
+
+
 def _generate_device_token() -> str:
-    return f"{token_urlsafe(22)}:APA91b{token_urlsafe(134)}"
+    return _generate_unique_android_guid()
+
+
+def is_android_guid(value: Optional[str]) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        guid = UUID(value)
+    except ValueError:
+        return False
+    return guid.version == 4 and value == str(guid)
 
 
 class IntercomAPI:
@@ -37,7 +68,7 @@ class IntercomAPI:
         self.refresh_token: Optional[str] = None
         self.refresh_expiration_date: Optional[str] = None
         self.device_token = device_token or _generate_device_token()
-        self.instance_id = instance_id or str(uuid4())
+        self.instance_id = instance_id or _generate_unique_android_guid()
         self.device_platform = device_platform
         self.dom_app = dom_app
         self._refresh_token_invalid: bool = False

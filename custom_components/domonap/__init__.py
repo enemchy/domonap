@@ -72,20 +72,25 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    from .api import IntercomAPI
+    from .api import IntercomAPI, is_android_guid
     from .notify_consumer import IntercomNotifyConsumer
 
     hass.data[DOMAIN].setdefault(entry.entry_id, {})
 
+    stored_device_token = entry.data.get(PARAM_DEVICE_TOKEN)
     api = IntercomAPI(
-        device_token=entry.data.get(PARAM_DEVICE_TOKEN),
+        device_token=(
+            stored_device_token if is_android_guid(stored_device_token) else None
+        ),
         instance_id=entry.data.get(PARAM_INSTANCE_ID),
     )
 
     new_data = dict(entry.data)
     if not new_data.get(PARAM_WEBRTC_PROXY_SECRET):
         new_data[PARAM_WEBRTC_PROXY_SECRET] = token_urlsafe(24)
-    if not new_data.get(PARAM_DEVICE_TOKEN):
+    if not is_android_guid(new_data.get(PARAM_DEVICE_TOKEN)):
+        if new_data.get(PARAM_DEVICE_TOKEN):
+            _LOGGER.info("Replacing legacy Domonap DeviceToken with Android GUID")
         new_data[PARAM_DEVICE_TOKEN] = api.device_token
     if not new_data.get(PARAM_INSTANCE_ID):
         new_data[PARAM_INSTANCE_ID] = api.instance_id
