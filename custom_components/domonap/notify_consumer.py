@@ -82,8 +82,13 @@ class IntercomNotifyConsumer:
     def connected(self) -> bool:
         return self._connected
 
-    def _on_token_update(self, access: str, _refresh: str, _exp: str) -> None:
-        self._headers["Authorization"] = f"Bearer {access}"
+    def _on_token_update(
+        self,
+        access: Optional[str],
+        _refresh: Optional[str],
+        _exp: Optional[str],
+    ) -> None:
+        self._headers["Authorization"] = f"Bearer {access or ''}"
 
     async def _connect_and_run(self) -> None:
         self._notify_id_token = await self._api.get_notify_id_token()
@@ -91,6 +96,7 @@ class IntercomNotifyConsumer:
         if not self._notify_id_token:
             raise RuntimeError("Negotiation failed: empty connectionToken")
         ws_url = WS_URL + self._notify_id_token
+        self._headers["Authorization"] = f"Bearer {self._api.access_token or ''}"
         async with self._session.ws_connect(ws_url, headers=self._headers) as ws:
             self._ws = ws
             _LOGGER.debug("WS connected")

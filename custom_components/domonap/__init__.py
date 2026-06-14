@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
 from secrets import token_urlsafe
-from typing import TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
 
+from homeassistant.components import persistent_notification
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.exceptions import ConfigEntryAuthFailed
 
 from .const import (
     DOMAIN,
@@ -20,7 +20,6 @@ from .const import (
     MEDIA_PROXY,
     PARAM_WEBRTC_PROXY_SECRET,
     PLATFORMS,
-    UPDATE_INTERVAL,
     WEBRTC_PROXY,
 )
 
@@ -28,6 +27,29 @@ if TYPE_CHECKING:
     from .api import IntercomAPI
 
 _LOGGER = logging.getLogger(__name__)
+
+REAUTH_NOTIFICATION_TITLE = "Domonap: требуется повторная авторизация"
+REAUTH_NOTIFICATION_MESSAGE = (
+    "Refresh token отсутствует или недействителен. "
+    "Выполните повторную авторизацию интеграции Domonap в Home Assistant."
+)
+
+
+def _reauth_notification_id(entry: ConfigEntry) -> str:
+    return f"{DOMAIN}_{entry.entry_id}_reauth_required"
+
+
+def _create_reauth_notification(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    persistent_notification.async_create(
+        hass,
+        REAUTH_NOTIFICATION_MESSAGE,
+        title=REAUTH_NOTIFICATION_TITLE,
+        notification_id=_reauth_notification_id(entry),
+    )
+
+
+def _dismiss_reauth_notification(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    persistent_notification.async_dismiss(hass, _reauth_notification_id(entry))
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
@@ -75,22 +97,41 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         new_data.get(PARAM_REFRESH_TOKEN),
         new_data.get(PARAM_REFRESH_EXPIRATION),
     )
+    setup_complete = False
 
-    def update_entry(access_token: str, refresh_token: str, refresh_expiration_date: str) -> None:
+    def update_entry(
+        access_token: Optional[str],
+        refresh_token: Optional[str],
+        refresh_expiration_date: Optional[str],
+    ) -> None:
+        nonlocal setup_complete
         _LOGGER.debug("Updating entry tokens in config_entry data")
         new_data = dict(entry.data)
         new_data.setdefault(PARAM_DEVICE_TOKEN, api.device_token)
         new_data.setdefault(PARAM_INSTANCE_ID, api.instance_id)
-        new_data.update(
-            {
-                PARAM_ACCESS_TOKEN: access_token,
-                PARAM_REFRESH_TOKEN: refresh_token,
-                PARAM_REFRESH_EXPIRATION: refresh_expiration_date,
-            }
-        )
+        if access_token and refresh_token and refresh_expiration_date:
+            new_data.update(
+                {
+                    PARAM_ACCESS_TOKEN: access_token,
+                    PARAM_REFRESH_TOKEN: refresh_token,
+                    PARAM_REFRESH_EXPIRATION: refresh_expiration_date,
+                }
+            )
+            _dismiss_reauth_notification(hass, entry)
+        else:
+            new_data.pop(PARAM_ACCESS_TOKEN, None)
+            new_data.pop(PARAM_REFRESH_TOKEN, None)
+            new_data.pop(PARAM_REFRESH_EXPIRATION, None)
+            _create_reauth_notification(hass, entry)
+            if setup_complete and hasattr(entry, "async_start_reauth"):
+                entry.async_start_reauth(hass)
         hass.config_entries.async_update_entry(entry, data=new_data)
 
     api.token_update_callback = update_entry
+    if not api.has_valid_refresh_token():
+        api.mark_session_expired("refresh token missing or expired")
+        raise ConfigEntryAuthFailed(REAUTH_NOTIFICATION_MESSAGE)
+    _dismiss_reauth_notification(hass, entry)
 
     consumer = IntercomNotifyConsumer(
         hass,
@@ -101,15 +142,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN][entry.entry_id][API] = api
     hass.data[DOMAIN][entry.entry_id]["notify_consumer"] = consumer
 
-    async def _update_tokens_tick(now: datetime) -> None:
-        try:
-            await api.update_token()
-        except Exception:
-            _LOGGER.debug("Token refresh failed", exc_info=True)
-
-    unsub_refresh = async_track_time_interval(hass, _update_tokens_tick, UPDATE_INTERVAL)
-    hass.data[DOMAIN][entry.entry_id]["unsub_refresh"] = unsub_refresh
-
+    setup_complete = True
     entry.async_create_background_task(hass, consumer.start(), "domonap_notify")
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -118,12 +151,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     stored = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
-
-    if (unsub := stored.get("unsub_refresh")) is not None:
-        try:
-            unsub()
-        except Exception:
-            _LOGGER.debug("Error unsubscribing refresh timer", exc_info=True)
 
     consumer = stored.get("notify_consumer")
     if consumer:

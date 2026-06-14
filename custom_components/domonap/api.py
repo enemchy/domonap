@@ -1,9 +1,9 @@
 import logging
 import aiohttp
 import asyncio
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from secrets import token_urlsafe
-from typing import Any, Dict, Optional, Union
+from typing import Any, Callable, Dict, Optional, Union
 from uuid import uuid4
 
 _LOGGER = logging.getLogger(__name__)
@@ -31,8 +31,6 @@ class IntercomAPI:
         instance_id: Optional[str] = None,
         device_platform: str = DEFAULT_DEVICE_PLATFORM,
         dom_app: str = DEFAULT_DOM_APP,
-        device_token_check_interval: int = 300,
-        refresh_skew_seconds: int = 60,
     ):
         self.base_url = base_url.rstrip("/")
         self.access_token: Optional[str] = None
@@ -42,17 +40,17 @@ class IntercomAPI:
         self.instance_id = instance_id or str(uuid4())
         self.device_platform = device_platform
         self.dom_app = dom_app
-        self.device_token_check_interval = device_token_check_interval
-        self._last_device_token_check: Optional[datetime] = None
-        self._updating_device_token: bool = False
-        self.refresh_skew = timedelta(seconds=refresh_skew_seconds)
+        self._refresh_token_invalid: bool = False
+        self._refresh_lock = asyncio.Lock()
         self.headers: Dict[str, str] = {
             "User-Agent": DEFAULT_USER_AGENT,
             "dom-app": _with_app_header_suffix(self.dom_app),
             "dom-platform": _with_app_header_suffix(self.device_platform),
             "instanceId": _with_app_header_suffix(self.instance_id),
         }
-        self.token_update_callback = None
+        self.token_update_callback: Optional[
+            Callable[[Optional[str], Optional[str], Optional[str]], None]
+        ] = None
         self._session: Optional[aiohttp.ClientSession] = None
         self._external_session: Optional[aiohttp.ClientSession] = None
         self._closed = False
@@ -87,10 +85,17 @@ class IntercomAPI:
     async def __aexit__(self, exc_type, exc, tb):
         await self.close()
 
-    def set_tokens(self, access_token: str, refresh_token: str, refresh_expiration_date: str):
+    def set_tokens(
+        self,
+        access_token: Optional[str],
+        refresh_token: Optional[str],
+        refresh_expiration_date: Optional[str],
+    ):
         self.access_token = access_token
         self.refresh_token = refresh_token
         self.refresh_expiration_date = refresh_expiration_date
+        if refresh_token:
+            self._refresh_token_invalid = False
         self.headers.pop("Authorization", None)
         if self._session and not self._session.closed:
             self._session._default_headers.clear()
@@ -103,43 +108,78 @@ class IntercomAPI:
                 return datetime.strptime(val, fmt)
             except ValueError:
                 continue
+        try:
+            return datetime.fromisoformat(val.replace("Z", "+00:00"))
+        except ValueError:
+            pass
         _LOGGER.warning("Cannot parse datetime: %s", val)
         return None
 
     def _now_utc(self) -> datetime:
         return datetime.now(timezone.utc)
 
-    async def _maybe_refresh_token(self) -> None:
-        if not self.refresh_expiration_date:
-            return
+    def _refresh_expired(self) -> bool:
+        if not self.refresh_token or not self.refresh_expiration_date:
+            return False
         exp = self._parse_dt(self.refresh_expiration_date)
-        if not exp:
-            return
-        if self._now_utc() >= (exp - self.refresh_skew):
-            _LOGGER.info("Refreshing tokens (old refresh_expiration: %s, now: %s)", self.refresh_expiration_date, self._now_utc())
-            await self.update_token()
+        return bool(exp and self._now_utc() >= exp)
 
-    async def _maybe_update_device_token(self) -> None:
-        if self._updating_device_token:
+    def has_valid_refresh_token(self) -> bool:
+        return bool(
+            self.refresh_token
+            and not self._refresh_token_invalid
+            and not self._refresh_expired()
+        )
+
+    def mark_session_expired(self, reason: str) -> None:
+        self._mark_refresh_token_invalid(reason)
+
+    def _mark_refresh_token_invalid(self, reason: str) -> None:
+        if self._refresh_token_invalid and not self.refresh_token and not self.access_token:
             return
-        now = self._now_utc()
-        if (
-            self._last_device_token_check is None
-            or (now - self._last_device_token_check).total_seconds() >= self.device_token_check_interval
-        ):
-            self._updating_device_token = True
-            try:
-                ok = await self.update_device_token(self.device_token)
-                self._last_device_token_check = now
-                if not ok:
-                    _LOGGER.debug("Device token not updated")
-            finally:
-                self._updating_device_token = False
+        _LOGGER.warning("Domonap session expired: %s", reason)
+        self._refresh_token_invalid = True
+        self.access_token = None
+        self.refresh_token = None
+        self.refresh_expiration_date = None
+        self.headers.pop("Authorization", None)
+        if self.token_update_callback:
+            self.token_update_callback(None, None, None)
+
+    def _refresh_unavailable_error(self, error: str) -> Dict[str, Any]:
+        return {
+            "error": error,
+            "ok": False,
+            "session_expired": self._refresh_token_invalid,
+            "body": "",
+        }
+
+    def _ensure_refresh_is_available(self) -> bool:
+        if self._refresh_token_invalid:
+            return False
+        if self._refresh_expired():
+            self._mark_refresh_token_invalid("refresh token expired")
+            return False
+        return bool(self.refresh_token)
 
     async def _ensure_alive(self) -> None:
-        await self._maybe_refresh_token()
-        if self.access_token:
-            await self._maybe_update_device_token()
+        if self._refresh_expired():
+            self._mark_refresh_token_invalid("refresh token expired")
+
+    async def _refresh_for_retry(self, first_try_access_token: Optional[str]) -> bool:
+        if not self._ensure_refresh_is_available():
+            return False
+        async with self._refresh_lock:
+            if (
+                first_try_access_token
+                and self.access_token
+                and self.access_token != first_try_access_token
+            ):
+                return True
+            if not self._ensure_refresh_is_available():
+                return False
+            result = await self.update_token()
+            return bool(isinstance(result, dict) and result.get("ok"))
 
     async def _post(
         self,
@@ -155,13 +195,18 @@ class IntercomAPI:
         if send_auth is None:
             send_auth = need_auth
         if need_auth:
+            if self._refresh_token_invalid:
+                return self._refresh_unavailable_error("Session expired")
             if not self.access_token:
                 return {"error": "No access token available", "ok": False, "body": ""}
             if ensure_alive:
                 await self._ensure_alive()
+            if not self.access_token:
+                return self._refresh_unavailable_error("Session expired")
 
         session = await self._ensure_session()
         url = f"{self.base_url}{path}"
+        first_try_access_token = self.access_token
 
         async def _do() -> aiohttp.ClientResponse:
             headers = dict(self.headers)
@@ -176,8 +221,8 @@ class IntercomAPI:
         resp = await _do()
         if resp.status == 401 and retry_on_401 and self.refresh_token:
             _LOGGER.warning("401 Unauthorized, refreshing token and retrying %s", path)
-            await self.update_token()
-            resp = await _do()
+            if await self._refresh_for_retry(first_try_access_token):
+                resp = await _do()
 
         if 200 <= resp.status < 300:
             if expect == "json":
@@ -206,7 +251,6 @@ class IntercomAPI:
         if isinstance(result, dict) and "error" in result:
             _LOGGER.error("UpdateDeviceToken failed: %s", result)
             return False
-        self._last_device_token_check = self._now_utc()
         _LOGGER.debug("UpdateDeviceToken ok")
         return True
 
@@ -246,8 +290,13 @@ class IntercomAPI:
         return {"countryCode": int(country_code), "number": int(phone_number)}
 
     async def update_token(self) -> Dict[str, Any]:
+        if self._refresh_token_invalid:
+            return self._refresh_unavailable_error("Refresh token is invalid")
         if not self.refresh_token:
             return {"error": "No refresh token available", "ok": False, "body": ""}
+        if self._refresh_expired():
+            self._mark_refresh_token_invalid("refresh token expired")
+            return self._refresh_unavailable_error("Refresh token expired")
         _LOGGER.info("Begin refreshToken. Old refresh_expiration=%s now=%s", self.refresh_expiration_date, self._now_utc())
         res = await self._post(
             "/sso-api/Authorization/RefreshToken",
@@ -257,6 +306,8 @@ class IntercomAPI:
             retry_on_401=False,
         )
         if isinstance(res, dict) and "error" in res and "status" in res:
+            if res["status"] in (400, 401, 403):
+                self._mark_refresh_token_invalid(f"refresh token rejected with HTTP {res['status']}")
             return res
         try:
             self.set_tokens(res["accessToken"], res["refreshToken"], res["refreshExpirationDate"])
@@ -346,6 +397,7 @@ class IntercomAPI:
                 return auth_error
 
         session = await self._ensure_external_session()
+        first_try_access_token = self.access_token
 
         def _request():
             request_headers = dict(headers or {})
@@ -381,9 +433,9 @@ class IntercomAPI:
                         "401 Unauthorized, refreshing token and retrying external GET %s",
                         url,
                     )
-                    await self.update_token()
-                    async with _request() as retry_resp:
-                        return await _handle_response(retry_resp)
+                    if await self._refresh_for_retry(first_try_access_token):
+                        async with _request() as retry_resp:
+                            return await _handle_response(retry_resp)
 
                 return await _handle_response(resp)
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
@@ -400,6 +452,8 @@ class IntercomAPI:
         if not self.access_token:
             return {"ok": False, "error": "No access token available", "body": ""}
         await self._ensure_alive()
+        if not self.access_token:
+            return self._refresh_unavailable_error("Session expired")
         return None
 
     async def create_whep_session(self, whep_url: str, offer_sdp: str) -> Dict[str, Any]:
@@ -408,6 +462,7 @@ class IntercomAPI:
             return auth_error
 
         session = await self._ensure_external_session()
+        first_try_access_token = self.access_token
 
         def _request():
             return session.post(
@@ -451,9 +506,9 @@ class IntercomAPI:
             async with _request() as resp:
                 if resp.status == 401 and self.refresh_token:
                     _LOGGER.warning("401 Unauthorized, refreshing token and retrying WHEP offer %s", whep_url)
-                    await self.update_token()
-                    async with _request() as retry_resp:
-                        return await _handle_response(retry_resp)
+                    if await self._refresh_for_retry(first_try_access_token):
+                        async with _request() as retry_resp:
+                            return await _handle_response(retry_resp)
 
                 return await _handle_response(resp)
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
@@ -466,6 +521,7 @@ class IntercomAPI:
             return auth_error
 
         session = await self._ensure_external_session()
+        first_try_access_token = self.access_token
 
         def _request():
             return session.patch(
@@ -495,9 +551,9 @@ class IntercomAPI:
             async with _request() as resp:
                 if resp.status == 401 and self.refresh_token:
                     _LOGGER.warning("401 Unauthorized, refreshing token and retrying WHEP candidate %s", session_url)
-                    await self.update_token()
-                    async with _request() as retry_resp:
-                        return await _handle_response(retry_resp)
+                    if await self._refresh_for_retry(first_try_access_token):
+                        async with _request() as retry_resp:
+                            return await _handle_response(retry_resp)
 
                 return await _handle_response(resp)
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
@@ -510,6 +566,7 @@ class IntercomAPI:
             return auth_error
 
         session = await self._ensure_external_session()
+        first_try_access_token = self.access_token
 
         def _request():
             return session.delete(
@@ -531,9 +588,9 @@ class IntercomAPI:
             async with _request() as resp:
                 if resp.status == 401 and self.refresh_token:
                     _LOGGER.warning("401 Unauthorized, refreshing token and retrying WHEP close %s", session_url)
-                    await self.update_token()
-                    async with _request() as retry_resp:
-                        return await _handle_response(retry_resp)
+                    if await self._refresh_for_retry(first_try_access_token):
+                        async with _request() as retry_resp:
+                            return await _handle_response(retry_resp)
 
                 return await _handle_response(resp)
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:

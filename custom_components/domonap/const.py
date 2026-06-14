@@ -1,4 +1,3 @@
-from datetime import timedelta
 from homeassistant.const import Platform
 
 import homeassistant.helpers.config_validation as cv
@@ -23,7 +22,6 @@ MEDIA_PROXY = "media_proxy"
 
 PLATFORMS: list[Platform] = [Platform.BUTTON, Platform.CAMERA, Platform.BINARY_SENSOR, Platform.SENSOR, Platform.IMAGE]
 
-UPDATE_INTERVAL = timedelta(hours=24)
 RESET_DELAY = 10 # секунды
 
 WS_MESSAGE_END = "\x1e"
