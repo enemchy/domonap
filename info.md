@@ -30,14 +30,20 @@ data:
   SipDomain: asterisk-2.domonap.ru
   SipPort: "7021"
   PushType: Domofon
-  photoUrl: https://s3-api.domonap.ru/snapshot/154543486.54786447
+  PhotoUrl: >-
+    https://home-assistant.local/api/domonap/media_proxy/...
+  photoUrl: >-
+    https://home-assistant.local/api/domonap/media_proxy/...
+  OriginalPhotoUrl: >-
+    https://s3-api.domonap.ru/...
 origin: LOCAL
 time_fired: "2025-06-18T15:10:58.919425+00:00"
 ```
 * `DoorId` - идентификатор двери
 * `Address` - адрес вызывающего устройства 
-* `PhotoUrl` / `photoUrl` - URL фотографии звонящего через локальный proxy Home Assistant с авторизацией в Domonap
-* `OriginalPhotoUrl` - оригинальный URL Domonap для диагностики
+* `PhotoUrl` / `photoUrl` - URL фотографии звонящего через локальный proxy Home Assistant. Интеграция получает исходный `photoUrl` так же, как приложение Domonap: из истории звонков `client-api/CallLog/GetCallLogs`. Если запись звонка или фото ещё недоступны, используется авторизованный `VideoPreview`
+* `OriginalPhotoUrl` - оригинальный `photoUrl` из истории звонков Domonap для диагностики
+* `PushPhotoUrl` - исходный `photoUrl` из push-события, если Domonap его прислал; хранится только для диагностики
 * `VideoPreview` - URL превью через локальный proxy Home Assistant с авторизацией в Domonap
 
 2. При входящем сообщении```domonap_receive_message``` следующего содержания:

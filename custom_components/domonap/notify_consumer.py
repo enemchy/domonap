@@ -12,7 +12,6 @@ from .const import (
     WS_MESSAGE_END,
     WS_HANDSHAKE_MESSAGE,
     WS_URL,
-    PHOTO_URL,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -149,7 +148,7 @@ class IntercomNotifyConsumer:
             if isinstance(push_data, dict):
                 evt = push_data.get("EventMessage")
                 if evt == "DomofonCalling":
-                    self._prepare_incoming_call_event(push_data)
+                    await self._prepare_incoming_call_event(push_data)
                     self._hass.bus.fire(EVENT_INCOMING_CALL, push_data)
                     _LOGGER.debug("Incoming call: %s", push_data)
                 else:
@@ -181,18 +180,8 @@ class IntercomNotifyConsumer:
         else:
             _LOGGER.debug(f"Unknown target type {data.get('target')} message:\n{data}")
 
-    def _prepare_incoming_call_event(self, push_data: dict) -> None:
+    async def _prepare_incoming_call_event(self, push_data: dict) -> None:
         call_id = str(push_data.get("CallId", ""))
-        photo_url = push_data.get("PhotoUrl") or push_data.get("photoUrl")
-        if not photo_url and call_id:
-            photo_url = PHOTO_URL + call_id
-
-        proxied_photo_url = self._proxied_media_url(photo_url)
-        if photo_url:
-            push_data.setdefault("OriginalPhotoUrl", photo_url)
-            push_data["PhotoUrl"] = proxied_photo_url or photo_url
-            push_data["photoUrl"] = proxied_photo_url or photo_url
-
         video_preview = push_data.get("VideoPreview") or push_data.get("videoPreview")
         proxied_video_preview = self._proxied_media_url(video_preview)
         if video_preview:
@@ -200,11 +189,85 @@ class IntercomNotifyConsumer:
             push_data["VideoPreview"] = proxied_video_preview or video_preview
             push_data["videoPreview"] = proxied_video_preview or video_preview
 
-    def _proxied_media_url(self, url: Optional[str]) -> Optional[str]:
+        push_photo_url = push_data.get("PhotoUrl") or push_data.get("photoUrl")
+        if push_photo_url:
+            push_data.setdefault("PushPhotoUrl", push_photo_url)
+
+        photo_url = await self._get_call_log_photo_url(call_id)
+
+        proxied_photo_url = self._proxied_media_url(
+            photo_url,
+            fallback_url=video_preview,
+            authorized=False,
+        )
+        if photo_url:
+            push_data.setdefault("OriginalPhotoUrl", photo_url)
+            push_data["PhotoUrl"] = proxied_photo_url or photo_url
+            push_data["photoUrl"] = proxied_photo_url or photo_url
+        elif video_preview:
+            push_data["PhotoUrl"] = proxied_video_preview or video_preview
+            push_data["photoUrl"] = proxied_video_preview or video_preview
+
+    async def _get_call_log_photo_url(self, call_id: str) -> Optional[str]:
+        if not call_id:
+            return None
+
+        for attempt in range(3):
+            if attempt:
+                await asyncio.sleep(1)
+
+            try:
+                response = await self._api.get_call_logs(per_page=20, current_page=1)
+            except Exception:
+                _LOGGER.debug("Failed to load Domonap call logs", exc_info=True)
+                return None
+            if not isinstance(response, dict):
+                _LOGGER.debug(
+                    "Unexpected Domonap call logs payload: %s",
+                    type(response).__name__,
+                )
+                return None
+            if "error" in response:
+                _LOGGER.debug("Failed to load Domonap call logs: %s", response)
+                return None
+
+            call_logs = response.get("results", [])
+            if not isinstance(call_logs, list):
+                _LOGGER.debug("Unexpected Domonap call logs results: %s", call_logs)
+                return None
+
+            for call_log in call_logs:
+                if not isinstance(call_log, dict):
+                    continue
+                if str(call_log.get("callId", "")) != call_id:
+                    continue
+                photo_url = call_log.get("photoUrl")
+                if photo_url:
+                    return photo_url
+                return None
+
+        _LOGGER.debug("Call log photoUrl not found for call %s", call_id)
+        return None
+
+    def _proxied_media_url(
+        self,
+        url: Optional[str],
+        *,
+        fallback_url: Optional[str] = None,
+        authorized: bool = True,
+        fallback_authorized: bool = True,
+    ) -> Optional[str]:
         if not url or not self._media_proxy or not self._media_proxy_secret:
             return None
         try:
-            return self._media_proxy.register_url(self._media_proxy_secret, self._api, url)
+            return self._media_proxy.register_url(
+                self._media_proxy_secret,
+                self._api,
+                url,
+                fallback_url=fallback_url,
+                authorized=authorized,
+                fallback_authorized=fallback_authorized,
+            )
         except Exception:
             _LOGGER.debug("Failed to register Domonap media proxy URL", exc_info=True)
             return None

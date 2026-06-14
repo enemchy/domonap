@@ -23,6 +23,9 @@ except ImportError:  # pragma: no cover - depends on HA version
 class MediaProxyTarget:
     api: object
     url: str
+    fallback_url: str | None = None
+    authorized: bool = True
+    fallback_authorized: bool = True
 
 
 class DomonapMediaProxy:
@@ -30,9 +33,23 @@ class DomonapMediaProxy:
         self._hass = hass
         self._targets: dict[tuple[str, str], MediaProxyTarget] = {}
 
-    def register_url(self, proxy_secret: str, api: object, url: str) -> str:
+    def register_url(
+        self,
+        proxy_secret: str,
+        api: object,
+        url: str,
+        fallback_url: str | None = None,
+        authorized: bool = True,
+        fallback_authorized: bool = True,
+    ) -> str:
         token = token_urlsafe(18)
-        self._targets[(proxy_secret, token)] = MediaProxyTarget(api=api, url=url)
+        self._targets[(proxy_secret, token)] = MediaProxyTarget(
+            api=api,
+            url=url,
+            fallback_url=fallback_url,
+            authorized=authorized,
+            fallback_authorized=fallback_authorized,
+        )
         return self.get_proxy_url(proxy_secret, token)
 
     def get_proxy_path(self, proxy_secret: str, token: str) -> str:
@@ -48,7 +65,21 @@ class DomonapMediaProxy:
         if target is None:
             raise web.HTTPNotFound(text="Unknown media")
 
-        response = await target.api.fetch_external_bytes(target.url)
+        response = await target.api.fetch_external_bytes(
+            target.url,
+            authorized=target.authorized,
+        )
+        if not response.get("ok") and target.fallback_url:
+            _LOGGER.debug(
+                "Domonap media proxy fallback for %s after %s",
+                target.url,
+                response.get("error"),
+            )
+            response = await target.api.fetch_external_bytes(
+                target.fallback_url,
+                authorized=target.fallback_authorized,
+            )
+
         if not response.get("ok"):
             _LOGGER.warning(
                 "Domonap media proxy failed for %s: %s",

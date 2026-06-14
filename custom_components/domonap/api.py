@@ -361,6 +361,24 @@ class IntercomAPI:
         payload = {"keyId": key_id}
         return await self._post("/client-api/Key/GetUserKey", payload, need_auth=True, expect="json")
 
+    async def get_call_logs(
+        self,
+        per_page: int = 20,
+        current_page: int = 1,
+        missed_calls: bool = False,
+    ):
+        payload = {
+            "currentPage": current_page,
+            "perPage": per_page,
+            "missedCalls": missed_calls,
+        }
+        return await self._post(
+            "/client-api/CallLog/GetCallLogs",
+            payload,
+            need_auth=True,
+            expect="json",
+        )
+
     async def open_relay_by_door_id(self, door_id: str):
         payload = {"doorId": door_id}
         res = await self._post("/client-api/Device/OpenRelayByDoorId", payload, need_auth=True, expect="text")

@@ -109,14 +109,26 @@ class IntercomCallImageEntity(ImageEntity):
         if event.data.get("DoorId") != self._door_id:
             return
 
-        photo_url: Optional[str] = event.data.get("OriginalPhotoUrl") or event.data.get(
-            "PhotoUrl"
+        original_photo_url: Optional[str] = event.data.get("OriginalPhotoUrl")
+        original_video_preview: Optional[str] = event.data.get("OriginalVideoPreview")
+        photo_url: Optional[str] = (
+            original_photo_url
+            or original_video_preview
+            or event.data.get("PhotoUrl")
         )
         if not photo_url:
             return
+        authorized = original_photo_url is None
+        fallback_url: Optional[str] = original_video_preview or event.data.get(
+            "VideoPreview"
+        )
 
         async def _fetch_and_set():
-            data = await self._http_get_bytes(photo_url)
+            data = await self._http_get_bytes(
+                photo_url,
+                authorized=authorized,
+                fallback_url=fallback_url,
+            )
             if data:
                 await self._set_image(data)
 
@@ -127,10 +139,31 @@ class IntercomCallImageEntity(ImageEntity):
         self._attr_image_last_updated = dt_util.utcnow()
         self.async_write_ha_state()
 
-    async def _http_get_bytes(self, url: str) -> Optional[bytes]:
-        response = await self._api.fetch_external_bytes(url)
+    async def _http_get_bytes(
+        self,
+        url: str,
+        *,
+        authorized: bool = True,
+        fallback_url: Optional[str] = None,
+        fallback_authorized: bool = True,
+    ) -> Optional[bytes]:
+        response = await self._api.fetch_external_bytes(url, authorized=authorized)
         if response.get("ok"):
             return response["body"]
+
+        if fallback_url:
+            _LOGGER.debug(
+                "GET %s failed: %s. Trying fallback %s",
+                url,
+                response.get("error"),
+                fallback_url,
+            )
+            response = await self._api.fetch_external_bytes(
+                fallback_url,
+                authorized=fallback_authorized,
+            )
+            if response.get("ok"):
+                return response["body"]
 
         _LOGGER.debug("GET %s failed: %s", url, response.get("error"))
         return None
