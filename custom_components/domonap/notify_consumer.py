@@ -11,6 +11,9 @@ from .const import (
     EVENT_INCOMING_CALL,
     WS_MESSAGE_END,
     WS_HANDSHAKE_MESSAGE,
+    WS_KEEPALIVE_INTERVAL,
+    WS_PING_MESSAGE,
+    WS_SERVER_TIMEOUT,
     WS_URL,
 )
 
@@ -37,7 +40,10 @@ class IntercomNotifyConsumer:
         self._max_reconnect: int = 10
         self._stop_event = asyncio.Event()
         self._session = async_get_clientsession(hass)
-        self._headers = {"Authorization": f"Bearer {self._api.access_token or ''}"}
+        # Заголовки WebSocket-апгрейда как у SignalR-клиента приложения:
+        # User-Agent, dom-app, dom-platform + Bearer (без instanceId/device-info).
+        self._headers = dict(self._api.signalr_headers())
+        self._headers["Authorization"] = f"Bearer {self._api.access_token or ''}"
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
         if hasattr(self._api, "token_update_callback") and self._api.token_update_callback is None:
             self._api.token_update_callback = self._on_token_update
@@ -95,33 +101,79 @@ class IntercomNotifyConsumer:
         if not self._notify_id_token:
             raise RuntimeError("Negotiation failed: empty connectionToken")
         ws_url = WS_URL + self._notify_id_token
+        self._headers = dict(self._api.signalr_headers())
         self._headers["Authorization"] = f"Bearer {self._api.access_token or ''}"
-        async with self._session.ws_connect(ws_url, headers=self._headers) as ws:
-            self._ws = ws
-            _LOGGER.debug("WS connected")
-            self._connected = True
-            self._reconnect_delay = 1
-            self._username = await self._api.get_username()
-            await ws.send_str(WS_HANDSHAKE_MESSAGE)
-            async for msg in ws:
-                if self._stop_event.is_set():
+        # receive_timeout = serverTimeout клиента Microsoft SignalR: если за 30с не
+        # пришло ни одного сообщения (сервер шлёт свои ping ~каждые 15с), считаем
+        # соединение мёртвым — receive() бросит TimeoutError, цикл прервётся и
+        # произойдёт переподключение. WS control-ping'и не используем, как и клиент.
+        ping_task: Optional[asyncio.Task] = None
+        try:
+            async with self._session.ws_connect(
+                ws_url, headers=self._headers, receive_timeout=WS_SERVER_TIMEOUT
+            ) as ws:
+                self._ws = ws
+                _LOGGER.debug("WS connected")
+                self._connected = True
+                self._reconnect_delay = 1
+                self._username = await self._api.get_username()
+                await ws.send_str(WS_HANDSHAKE_MESSAGE)
+                ping_task = asyncio.ensure_future(self._keepalive(ws))
+                try:
+                    async for msg in ws:
+                        if self._stop_event.is_set():
+                            break
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            await self._handle_text(msg.data, ws)
+                            if self._callbacks:
+                                await self._publish_updates()
+                        elif msg.type == aiohttp.WSMsgType.PING:
+                            await ws.pong()
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            _LOGGER.debug("WS closed/error: %s", msg.data)
+                            break
+                finally:
+                    if ping_task is not None:
+                        ping_task.cancel()
+        except (asyncio.TimeoutError, aiohttp.ServerTimeoutError):
+            # serverTimeout: сервер молчит дольше WS_SERVER_TIMEOUT — штатный
+            # признак мёртвого соединения, переподключаемся (не ошибка).
+            _LOGGER.debug("WS server timeout, reconnecting")
+        finally:
+            self._connected = False
+            self._username = ""
+            self._ws = None
+            _LOGGER.debug("WS disconnected")
+
+    async def _keepalive(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        """Периодически шлёт SignalR ping (`{"type":6}`).
+
+        Без этого сервер разрывает соединение по ClientTimeoutInterval, когда
+        нет входящих звонков/сообщений, и уведомления перестают приходить.
+        """
+        try:
+            while not ws.closed and not self._stop_event.is_set():
+                await asyncio.sleep(WS_KEEPALIVE_INTERVAL)
+                if ws.closed or self._stop_event.is_set():
                     break
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    await self._handle_text(msg.data, ws)
-                    if self._callbacks:
-                        await self._publish_updates()
-                elif msg.type == aiohttp.WSMsgType.PING:
-                    await ws.pong()
-                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                    _LOGGER.debug("WS closed/error: %s", msg.data)
+                try:
+                    await ws.send_str(WS_PING_MESSAGE)
+                except Exception:
                     break
-        self._connected = False
-        self._username = ""
-        self._ws = None
-        _LOGGER.debug("WS disconnected")
+        except asyncio.CancelledError:
+            pass
 
     async def _handle_text(self, raw: str, ws: aiohttp.ClientWebSocketResponse) -> None:
-        payload = raw.rstrip(WS_MESSAGE_END)
+        # SignalR может упаковать несколько сообщений в один WebSocket-кадр,
+        # разделяя их символом-разделителем записей (0x1e). Разбираем каждую
+        # запись отдельно, иначе json.loads падает на составном кадре и все
+        # сообщения (включая ReceivePush о звонке) теряются.
+        for record in raw.split(WS_MESSAGE_END):
+            if not record:
+                continue
+            await self._handle_record(record, ws)
+
+    async def _handle_record(self, payload: str, ws: aiohttp.ClientWebSocketResponse) -> None:
         if payload == "{}":
             _LOGGER.debug("Handshake ack")
             return
@@ -134,7 +186,10 @@ class IntercomNotifyConsumer:
         if t == 1:
             await self._handle_invocation(data, ws)
         elif t == 6:
-            await ws.send_str(payload + WS_MESSAGE_END)
+            # Серверный ping. Клиент Microsoft SignalR его НЕ отправляет обратно —
+            # он лишь сбрасывает serverTimeout и шлёт собственные ping по таймеру
+            # (см. _keepalive). Поэтому просто игнорируем, без эха.
+            _LOGGER.debug("Server ping")
         elif t == 3:
             _LOGGER.debug("Completion frame: %s", data)
         else:
@@ -168,8 +223,15 @@ class IntercomNotifyConsumer:
             # После события offline на все сессии текущего пользователя перестают приходить уведомления о звонках
             if user == self._username and status == "offline":
                 _LOGGER.debug(f"Current login user: {user} status changed to {status}. Reconnecting websocket...")
-                await self.stop()
-                await self.start()
+                # Закрываем текущий сокет: цикл _connect_and_run завершится, и
+                # внешний цикл start() автоматически переподключится (в отличие
+                # от stop()+start(), которые вызывались рекурсивно из цикла чтения
+                # и приводили к вложенным бесконечным циклам).
+                if self._ws is not None and not self._ws.closed:
+                    try:
+                        await self._ws.close()
+                    except Exception:
+                        _LOGGER.debug("Error closing websocket for reconnect", exc_info=True)
 
         elif target == "ReceiveMessage":
             chat_data = data.get('arguments')[0]

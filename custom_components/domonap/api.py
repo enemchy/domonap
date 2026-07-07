@@ -1,7 +1,9 @@
+import json
 import logging
 import aiohttp
 import asyncio
 from datetime import datetime, timezone
+from hashlib import sha256
 from secrets import token_bytes
 from typing import Any, Callable, Dict, Optional, Union
 from uuid import UUID
@@ -13,12 +15,64 @@ DEFAULT_DEVICE_PLATFORM = "Android"
 DEFAULT_DOM_APP = "mobile"
 DEFAULT_JSON_CONTENT_TYPE = "application/json; charset=UTF-8"
 DEFAULT_USER_AGENT = "okhttp/5.3.2"
+# User-Agent, который клиент Microsoft SignalR (Java, v8.0.6) ставит на negotiate
+# и WebSocket-апгрейд. UserAgentHelper.createUserAgentString():
+#   "Microsoft SignalR/8.0 (8.0.6; <os.name>; Java; <java.version>; <java.vendor>)"
+# На Android: os.name="Linux", java.version="0", java.vendor="The Android Project".
+# OkHttp не перезаписывает UA, т.к. SignalR уже задал его в заголовках запроса.
+SIGNALR_USER_AGENT = "Microsoft SignalR/8.0 (8.0.6; Linux; Java; 0; The Android Project)"
 _ANDROID_GUID_RETRY_LIMIT = 8
 _GENERATED_ANDROID_GUIDS: set[str] = set()
+
+# Версия приложения Domonap (BuildConfig.VERSION_CODE / VERSION_NAME из APK).
+# Подставляется в заголовок device-info, чтобы совпадать с оригинальным клиентом.
+APP_VERSION_CODE = "9848"
+APP_VERSION_NAME = "9848"
+
+# Реальные согласованные Build-профили Android-устройств (Google-флейвор,
+# DeviceCoreService.Android). Профиль выбирается детерминированно по instanceId,
+# поэтому стабилен для установки и различается между установками — как у набора
+# реальных телефонов, а не одинаковый на всех.
+_DEVICE_PROFILES = (
+    # brand, manufacturer, model, device, product, build_id, release, sdk
+    ("samsung", "samsung", "SM-S911B", "dm3q", "dm3qxxx", "UP1A.231005.007", "14", "34"),
+    ("samsung", "samsung", "SM-A546E", "a54x", "a54xnaser", "UP1A.231005.007", "14", "34"),
+    ("samsung", "samsung", "SM-G991B", "o1s", "o1sxxx", "TP1A.220624.014", "13", "33"),
+    ("google", "Google", "Pixel 7", "panther", "panther", "UP1A.231105.003", "14", "34"),
+    ("google", "Google", "Pixel 6a", "bluejay", "bluejay", "UP1A.231105.001", "14", "34"),
+    ("Xiaomi", "Xiaomi", "2211133C", "fuxi", "fuxi", "UKQ1.230804.001", "14", "34"),
+    ("Redmi", "Xiaomi", "23021RAA2Y", "ruby", "ruby_global", "TP1A.220624.014", "13", "33"),
+    ("OnePlus", "OnePlus", "CPH2449", "OP594DL1", "CPH2449", "UKQ1.230924.001", "14", "34"),
+)
 
 
 def _with_app_header_suffix(value: str) -> str:
     return value if value.endswith(";") else f"{value};"
+
+
+def _build_device_info(instance_id: str) -> str:
+    """Собирает заголовок `device-info` в том же формате, что и приложение.
+
+    Приложение сериализует Gson'ом модель DeviceInfoModel (компактный JSON без
+    пробелов) и шлёт его на каждом запросе. Профиль устройства выбирается по
+    instanceId, чтобы быть стабильным и правдоподобным.
+    """
+    idx = int(sha256(instance_id.encode("utf-8")).hexdigest(), 16) % len(_DEVICE_PROFILES)
+    brand, manufacturer, model, device, product, build_id, release, sdk = _DEVICE_PROFILES[idx]
+    info = {
+        "OsVersion": sdk,
+        "Release": release,
+        "Device": device,
+        "Model": model,
+        "Product": product,
+        "Brand": brand,
+        "ID": build_id,
+        "Manufacturer": manufacturer,
+        "InstanceId": instance_id,
+        "versionCode": APP_VERSION_CODE,
+        "versionName": APP_VERSION_NAME,
+    }
+    return json.dumps(info, separators=(",", ":"), ensure_ascii=False)
 
 
 def _generate_android_guid() -> str:
@@ -73,11 +127,15 @@ class IntercomAPI:
         self.dom_app = dom_app
         self._refresh_token_invalid: bool = False
         self._refresh_lock = asyncio.Lock()
+        # Порядок и формат заголовков как у DeviceIdInterceptor приложения:
+        # dom-app/dom-platform с суффиксом ";", instanceId — БЕЗ ";", плюс
+        # device-info с JSON профиля устройства.
         self.headers: Dict[str, str] = {
             "User-Agent": DEFAULT_USER_AGENT,
             "dom-app": _with_app_header_suffix(self.dom_app),
             "dom-platform": _with_app_header_suffix(self.device_platform),
-            "instanceId": _with_app_header_suffix(self.instance_id),
+            "instanceId": self.instance_id,
+            "device-info": _build_device_info(self.instance_id),
         }
         self.token_update_callback: Optional[
             Callable[[Optional[str], Optional[str], Optional[str]], None]
@@ -131,6 +189,21 @@ class IntercomAPI:
         if self._session and not self._session.closed:
             self._session._default_headers.clear()
             self._session._default_headers.update(self.headers)
+
+    def signalr_headers(self) -> Dict[str, str]:
+        """Заголовки для SignalR (negotiate + WebSocket-апгрейд).
+
+        В приложении hub использует отдельный OkHttp-клиент, который в DI-колбэке
+        (`provideSignalR`) получает только DeviceCoreServicesRepository, поэтому
+        добавляет `dom-app`/`dom-platform`, но НЕ instanceId и НЕ device-info
+        (у него нет соответствующих репозиториев). Авторизацию (Bearer) добавляет
+        вызывающий код. User-Agent — как у клиента Microsoft SignalR, а не okhttp.
+        """
+        return {
+            "User-Agent": SIGNALR_USER_AGENT,
+            "dom-app": self.headers["dom-app"],
+            "dom-platform": self.headers["dom-platform"],
+        }
 
     def _parse_dt(self, val: str) -> Optional[datetime]:
         fmts = ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z")
@@ -222,6 +295,7 @@ class IntercomAPI:
         send_auth: Optional[bool] = None,
         expect: str = "json",
         retry_on_401: bool = True,
+        header_set: Optional[Dict[str, str]] = None,
     ) -> Union[Dict[str, Any], str]:
         if send_auth is None:
             send_auth = need_auth
@@ -240,7 +314,7 @@ class IntercomAPI:
         first_try_access_token = self.access_token
 
         async def _do() -> aiohttp.ClientResponse:
-            headers = dict(self.headers)
+            headers = dict(self.headers if header_set is None else header_set)
             if payload is not None:
                 headers["Content-Type"] = DEFAULT_JSON_CONTENT_TYPE
             if send_auth and self.access_token:
@@ -655,7 +729,12 @@ class IntercomAPI:
         return {"ok": True, "body": res}
 
     async def get_notify_id_token(self) -> Optional[str]:
-        res = await self._post("/notificationHub/negotiate?negotiateVersion=1", need_auth=True, expect="json")
+        res = await self._post(
+            "/notificationHub/negotiate?negotiateVersion=1",
+            need_auth=True,
+            expect="json",
+            header_set=self.signalr_headers(),
+        )
         if isinstance(res, dict) and "error" in res and "status" in res:
             _LOGGER.debug("negotiate failed: %s", res)
             return None
