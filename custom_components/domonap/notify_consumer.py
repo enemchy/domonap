@@ -2,6 +2,7 @@ import json
 import logging
 import asyncio
 import aiohttp
+from urllib.parse import quote
 from random import randint
 from typing import Callable, Optional, Any, Iterable, Union
 from homeassistant.core import HomeAssistant
@@ -110,7 +111,7 @@ class IntercomNotifyConsumer:
         _LOGGER.debug("Negotiated connectionToken: %s", self._notify_id_token)
         if not self._notify_id_token:
             raise RuntimeError("Negotiation failed: empty connectionToken")
-        ws_url = WS_URL + self._notify_id_token
+        ws_url = WS_URL + quote(self._notify_id_token, safe="")
         self._headers = dict(self._api.signalr_headers())
         self._headers["Authorization"] = f"Bearer {self._api.access_token or ''}"
         _LOGGER.warning("Domonap notificationHub negotiated connection token")
