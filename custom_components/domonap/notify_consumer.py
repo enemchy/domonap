@@ -113,6 +113,7 @@ class IntercomNotifyConsumer:
         ws_url = WS_URL + self._notify_id_token
         self._headers = dict(self._api.signalr_headers())
         self._headers["Authorization"] = f"Bearer {self._api.access_token or ''}"
+        _LOGGER.warning("Domonap notificationHub negotiated connection token")
         # receive_timeout = serverTimeout клиента Microsoft SignalR: если за 30с не
         # пришло ни одного сообщения (сервер шлёт свои ping ~каждые 15с), считаем
         # соединение мёртвым — receive() бросит TimeoutError, цикл прервётся и
@@ -123,7 +124,7 @@ class IntercomNotifyConsumer:
                 ws_url, headers=self._headers, receive_timeout=WS_SERVER_TIMEOUT
             ) as ws:
                 self._ws = ws
-                _LOGGER.debug("WS connected")
+                _LOGGER.warning("Domonap notificationHub websocket connected")
                 self._connected = True
                 self._reconnect_delay = 1
                 self._username = await self._api.get_username()
@@ -148,12 +149,12 @@ class IntercomNotifyConsumer:
         except (asyncio.TimeoutError, aiohttp.ServerTimeoutError):
             # serverTimeout: сервер молчит дольше WS_SERVER_TIMEOUT — штатный
             # признак мёртвого соединения, переподключаемся (не ошибка).
-            _LOGGER.debug("WS server timeout, reconnecting")
+            _LOGGER.warning("Domonap notificationHub server timeout, reconnecting")
         finally:
             self._connected = False
             self._username = ""
             self._ws = None
-            _LOGGER.debug("WS disconnected")
+            _LOGGER.warning("Domonap notificationHub websocket disconnected")
 
     async def _keepalive(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         """Периодически шлёт SignalR ping (`{"type":6}`).
@@ -208,6 +209,11 @@ class IntercomNotifyConsumer:
     async def _handle_invocation(self, data: dict, ws: aiohttp.ClientWebSocketResponse) -> None:
         target = data.get("target")
         args: Iterable = data.get("arguments") or []
+        _LOGGER.warning(
+            "Domonap SignalR invocation target=%s args=%s",
+            target,
+            self._summarize_payload(args),
+        )
         if target == "ReceivePush":
             push_data = self._extract_push_payload(args)
             if not isinstance(push_data, dict):
