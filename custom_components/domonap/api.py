@@ -741,11 +741,11 @@ class IntercomAPI:
         if not isinstance(res, dict):
             _LOGGER.warning("Domonap notificationHub negotiate returned non-object: %s", type(res).__name__)
             return None
-        token = res.get("connectionId") or res.get("connectionToken")
+        token = res.get("connectionToken") or res.get("connectionId")
         _LOGGER.warning(
             "Domonap notificationHub negotiate keys=%s selected=%s",
             sorted(res),
-            "connectionId" if res.get("connectionId") else "connectionToken",
+            "connectionToken" if res.get("connectionToken") else "connectionId",
         )
         _LOGGER.debug("get_notify_id_token -> %s", token)
         return token

@@ -112,6 +112,8 @@ class IntercomNotifyConsumer:
         if not self._notify_id_token:
             raise RuntimeError("Negotiation failed: empty connectionToken")
         ws_url = WS_URL + quote(self._notify_id_token, safe="")
+        if self._api.access_token:
+            ws_url += "&access_token=" + quote(self._api.access_token, safe="")
         self._headers = dict(self._api.signalr_headers())
         self._headers["Authorization"] = f"Bearer {self._api.access_token or ''}"
         _LOGGER.warning("Domonap notificationHub negotiated connection token")
