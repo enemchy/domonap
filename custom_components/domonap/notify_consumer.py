@@ -69,11 +69,11 @@ class IntercomNotifyConsumer:
                 if e.status == 401:
                     _LOGGER.error("WS 401 Unauthorized: %s", e.headers.get("WWW-Authenticate"))
                 elif e.status == 404:
-                    _LOGGER.debug("WS 404 Not found")
+                    _LOGGER.warning("Domonap notificationHub WS 404 Not found")
                 else:
-                    _LOGGER.debug("WS handshake error: %s", e)
+                    _LOGGER.warning("Domonap notificationHub WS handshake error: %s", e, exc_info=True)
             except Exception as e:
-                _LOGGER.debug("Notify loop error: %s", e)
+                _LOGGER.warning("Domonap notificationHub notify loop error: %s", e, exc_info=True)
             if self._stop_event.is_set():
                 break
             await asyncio.sleep(self._reconnect_delay)
