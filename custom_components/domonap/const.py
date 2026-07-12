@@ -27,7 +27,7 @@ RESET_DELAY = 10 # секунды
 WS_MESSAGE_END = "\x1e"
 WS_HANDSHAKE_MESSAGE = '{"protocol":"json","version":1}' + WS_MESSAGE_END
 WS_PING_MESSAGE = '{"type":6}' + WS_MESSAGE_END
-WS_URL = "wss://api.domonap.ru/notificationHub/?id="
+WS_URL = "wss://api.domonap.ru/notificationHub?id="
 
 # SignalR keep-alive параметры (значения по умолчанию клиента Microsoft SignalR).
 # Клиент шлёт app-level ping ({"type":6}) каждые WS_KEEPALIVE_INTERVAL секунд
