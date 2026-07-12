@@ -19,6 +19,16 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+_REDACTED_KEYS = {
+    "Authorization",
+    "access_token",
+    "refresh_token",
+    "SipPassword",
+    "sipPassword",
+    "password",
+    "token",
+}
+
 
 class IntercomNotifyConsumer:
     def __init__(
@@ -199,15 +209,28 @@ class IntercomNotifyConsumer:
         target = data.get("target")
         args: Iterable = data.get("arguments") or []
         if target == "ReceivePush":
-            push_data = args[2] if len(args) >= 3 else None
-            if isinstance(push_data, dict):
-                evt = push_data.get("EventMessage")
-                if evt == "DomofonCalling":
-                    await self._prepare_incoming_call_event(push_data)
-                    self._hass.bus.fire(EVENT_INCOMING_CALL, push_data)
-                    _LOGGER.debug("Incoming call: %s", push_data)
-                else:
-                    _LOGGER.debug("Unknown EventMessage=%s push=%s", evt, str(push_data)[:200])
+            push_data = self._extract_push_payload(args)
+            if not isinstance(push_data, dict):
+                _LOGGER.warning(
+                    "ReceivePush did not contain a recognized payload: %s",
+                    self._summarize_payload(args),
+                )
+                return
+
+            evt = push_data.get("EventMessage")
+            push_type = push_data.get("PushType")
+            if self._is_incoming_call_payload(push_data):
+                push_data.setdefault("EventMessage", "DomofonCalling")
+                await self._prepare_incoming_call_event(push_data)
+                self._hass.bus.fire(EVENT_INCOMING_CALL, push_data)
+                _LOGGER.debug("Incoming call: %s", self._summarize_payload(push_data))
+            else:
+                _LOGGER.warning(
+                    "Unknown ReceivePush payload EventMessage=%s PushType=%s payload=%s",
+                    evt,
+                    push_type,
+                    self._summarize_payload(push_data),
+                )
         elif target in ('ReceiveOnline', "ReceiveOffline"):
             user = data.get('arguments')[0]
             status = data.get('target').replace('ReceiveO', 'o')
@@ -241,6 +264,110 @@ class IntercomNotifyConsumer:
             _LOGGER.debug(f"Read confirm messages in channel {data.get('arguments')[0]}")
         else:
             _LOGGER.debug(f"Unknown target type {data.get('target')} message:\n{data}")
+
+
+    @classmethod
+    def _extract_push_payload(cls, args: Iterable) -> Optional[dict]:
+        """Find the actual Domonap push payload in a SignalR ReceivePush call.
+
+        Historically Domonap sent the useful object as ``arguments[2]``. Recent
+        server/client changes can make that assumption brittle: the payload may
+        move to another argument or be wrapped/encoded. Scan the full argument
+        list so incoming-call events are not silently dropped when only the
+        SignalR shape changes.
+        """
+        for candidate in cls._iter_push_candidates(args):
+            if isinstance(candidate, dict) and cls._looks_like_push_payload(candidate):
+                return candidate
+        return None
+
+    @classmethod
+    def _iter_push_candidates(cls, value: Any):
+        if isinstance(value, dict):
+            yield value
+            for key in (
+                "data",
+                "Data",
+                "payload",
+                "Payload",
+                "message",
+                "Message",
+                "push",
+                "Push",
+            ):
+                if key in value:
+                    yield from cls._iter_push_candidates(value[key])
+            return
+
+        if isinstance(value, str):
+            try:
+                decoded = json.loads(value)
+            except json.JSONDecodeError:
+                return
+            yield from cls._iter_push_candidates(decoded)
+            return
+
+        if isinstance(value, Iterable) and not isinstance(value, (bytes, bytearray)):
+            for item in value:
+                yield from cls._iter_push_candidates(item)
+
+    @staticmethod
+    def _looks_like_push_payload(value: dict) -> bool:
+        keys = set(value)
+        return bool(
+            "EventMessage" in keys
+            or "PushType" in keys
+            or {"DoorId", "CallId"} & keys
+            or {"VideoPreview", "videoPreview", "PhotoUrl", "photoUrl"} & keys
+        )
+
+    @staticmethod
+    def _is_incoming_call_payload(push_data: dict) -> bool:
+        event_message = push_data.get("EventMessage")
+        push_type = push_data.get("PushType")
+        return bool(
+            event_message == "DomofonCalling"
+            or (
+                push_type == "Domofon"
+                and push_data.get("DoorId")
+            )
+            or (
+                push_data.get("DoorId")
+                and (
+                    push_data.get("CallId")
+                    or push_data.get("VideoPreview")
+                    or push_data.get("videoPreview")
+                    or push_data.get("PhotoUrl")
+                    or push_data.get("photoUrl")
+                )
+            )
+        )
+
+    @classmethod
+    def _summarize_payload(cls, value: Any, *, limit: int = 1200) -> str:
+        try:
+            text = json.dumps(cls._redact_payload(value), ensure_ascii=False, default=str)
+        except Exception:
+            text = str(value)
+        if len(text) > limit:
+            return text[:limit] + "..."
+        return text
+
+    @classmethod
+    def _redact_payload(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            redacted = {}
+            for key, item in value.items():
+                if key in _REDACTED_KEYS or any(part in str(key).lower() for part in ("password", "token")):
+                    redacted[key] = "***"
+                else:
+                    redacted[key] = cls._redact_payload(item)
+            return redacted
+        if isinstance(value, list):
+            return [cls._redact_payload(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(cls._redact_payload(item) for item in value)
+        return value
 
     async def _prepare_incoming_call_event(self, push_data: dict) -> None:
         call_id = str(push_data.get("CallId", ""))
